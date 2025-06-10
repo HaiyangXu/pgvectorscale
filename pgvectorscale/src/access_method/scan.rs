@@ -5,7 +5,7 @@ use pgrx::{pg_sys::InvalidOffsetNumber, *};
 use crate::{
     access_method::{
         graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
-        sbq::storage::SbqSpeedupStorage,
+        sbq::storage::SbqSpeedupStorage, custom_executor::{BitmapFilter, execute_bitmap_filtered_vector_search},
     },
     util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
 };
@@ -42,6 +42,9 @@ struct TSVScanState {
     distance_fn: Option<DistanceFn>,
     meta_page: MetaPage,
     last_buffer: Option<PinnedBufferShare>,
+    // For bitmap filtering context
+    can_use_bitmap_filtering: bool,
+    pending_bitmap_filter: Option<BitmapFilter>,
 }
 
 impl TSVScanState {
@@ -51,6 +54,8 @@ impl TSVScanState {
             distance_fn: None,
             meta_page,
             last_buffer: None,
+            can_use_bitmap_filtering: false,
+            pending_bitmap_filter: None,
         }
     }
 
@@ -86,6 +91,21 @@ impl TSVScanState {
 
         self.storage = PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(store_type);
         self.distance_fn = Some(distance);
+    }
+
+    /// Check if this scan could benefit from bitmap filtering
+    /// This is a heuristic that would be improved based on query analysis
+    fn can_benefit_from_bitmap_filtering(&self, _query: &LabeledVector) -> bool {
+        // For now, we'll enable bitmap filtering for all queries as a demonstration
+        // In practice, this would analyze the query to determine if there are 
+        // other conditions that could benefit from early filtering
+        true
+    }
+
+    /// Set a bitmap filter for this scan state
+    fn set_bitmap_filter(&mut self, bitmap_filter: BitmapFilter) {
+        self.pending_bitmap_filter = Some(bitmap_filter);
+        self.can_use_bitmap_filtering = true;
     }
 }
 
@@ -475,4 +495,162 @@ fn end_scan<S: Storage>(
 
     debug_assert_eq!(iter.quantizer_stats.node_reads, 1);
     debug_assert_eq!(iter.quantizer_stats.node_writes, 0);
+}
+
+/* Add bitmap scan support with enhanced bitmap filtering */
+#[pg_guard]
+pub extern "C" fn amgetbitmap(
+    scan: pg_sys::IndexScanDesc,
+    tbm: *mut pg_sys::TIDBitmap,
+) -> i64 {
+    let scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
+    let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
+    
+    let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
+    let heaprel = unsafe { PgRelation::from_pg(scan.heapRelation) };
+    
+    let mut ntids = 0i64;
+    
+    // Check if we have a pending bitmap filter to apply
+    if let Some(bitmap_filter) = state.pending_bitmap_filter.take() {
+        // Use the bitmap-filtered vector search approach
+        let query = unsafe { 
+            // Extract query from the scan state - this would need to be stored during amrescan
+            // For now, we'll use a fallback approach
+            let keys = std::slice::from_raw_parts(scan.keyData as *const pg_sys::ScanKeyData, scan.numberOfKeys as _);
+            let orderby_keys = std::slice::from_raw_parts(scan.orderByData as *const pg_sys::ScanKeyData, scan.numberOfOrderBys as _);
+            LabeledVector::from_scan_key_data(keys, orderby_keys, &state.meta_page)
+        };
+        
+        let search_list_size = super::guc::TSV_QUERY_SEARCH_LIST_SIZE.get() as usize;
+        
+        let results = unsafe {
+            execute_bitmap_filtered_vector_search(
+                scan.indexRelation,
+                scan.heapRelation,
+                query,
+                search_list_size,
+                Some(bitmap_filter),
+            )
+        };
+        
+        // Add results to the bitmap
+        for (heap_pointer, _index_pointer) in results {
+            let mut ctid = pg_sys::ItemPointerData::default();
+            heap_pointer.to_item_pointer_data(&mut ctid);
+            
+            unsafe {
+                pg_sys::tbm_add_tuples(tbm, &mut ctid, 1, false);
+            }
+            ntids += 1;
+        }
+        
+        return ntids;
+    }
+    
+    // Fallback to standard bitmap scan
+    let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
+    
+    match &mut storage {
+        StorageState::SbqSpeedup(quantizer, iter) => {
+            let bq = SbqSpeedupStorage::load_for_search(
+                &indexrel,
+                &heaprel,
+                quantizer,
+                &state.meta_page,
+            );
+            
+            // Collect all matching tuples for bitmap scan
+            loop {
+                let next = iter.next_with_resort(&scan, &indexrel, &bq);
+                match next {
+                    Some((heap_pointer, _index_pointer)) => {
+                        // Add tuple to bitmap
+                        let mut ctid = pg_sys::ItemPointerData::default();
+                        heap_pointer.to_item_pointer_data(&mut ctid);
+                        
+                        unsafe {
+                            pg_sys::tbm_add_tuples(tbm, &mut ctid, 1, false);
+                        }
+                        ntids += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        StorageState::Plain(iter) => {
+            let storage = PlainStorage::load_for_search(&indexrel, &heaprel, state.distance_fn.unwrap());
+            
+            // Collect all matching tuples for bitmap scan
+            loop {
+                let next = if state.meta_page.get_num_dimensions()
+                    == state.meta_page.get_num_dimensions_to_index()
+                {
+                    /* no need to resort */
+                    iter.next(&storage)
+                } else {
+                    iter.next_with_resort(&scan, &indexrel, &storage)
+                };
+                
+                match next {
+                    Some((heap_pointer, _index_pointer)) => {
+                        // Add tuple to bitmap
+                        let mut ctid = pg_sys::ItemPointerData::default();
+                        heap_pointer.to_item_pointer_data(&mut ctid);
+                        
+                        unsafe {
+                            pg_sys::tbm_add_tuples(tbm, &mut ctid, 1, false);
+                        }
+                        ntids += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    
+    ntids
+}
+
+/// Public interface for external bitmap filtering integration
+/// This can be called by query planner hooks to set up bitmap filtering
+pub unsafe fn setup_bitmap_filtered_scan(
+    scan: pg_sys::IndexScanDesc,
+    external_bitmap: *mut pg_sys::TIDBitmap,
+) -> bool {
+    let scan_box: PgBox<pg_sys::IndexScanDescData> = PgBox::from_pg(scan);
+    let state = (scan_box.opaque as *mut TSVScanState).as_mut();
+    
+    if let Some(state) = state {
+        if !external_bitmap.is_null() {
+            let bitmap_filter = BitmapFilter::new(external_bitmap);
+            state.set_bitmap_filter(bitmap_filter);
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if a scan can benefit from bitmap filtering
+/// This can be called during query planning to determine optimization opportunities
+pub unsafe fn can_use_bitmap_filtering(
+    index_relation: pg_sys::Relation,
+    _heap_relation: pg_sys::Relation,
+    query_keys: *const pg_sys::ScanKeyData,
+    n_keys: i32,
+) -> bool {
+    if index_relation.is_null() || query_keys.is_null() || n_keys == 0 {
+        return false;
+    }
+    
+    let indexrel = PgRelation::from_pg(index_relation);
+    let meta_page = MetaPage::fetch(&indexrel);
+    
+    // This is a simple heuristic - in practice, this would be more sophisticated
+    // and would analyze the query structure to determine if bitmap filtering is beneficial
+    
+    // For demonstration, we'll say bitmap filtering is beneficial for queries
+    // that have vector similarity conditions (which all vector queries do)
+    true
 }

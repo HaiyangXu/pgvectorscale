@@ -12,6 +12,8 @@ pub unsafe extern "C" fn _PG_init() {
     access_method::distance::init();
     access_method::options::init();
     access_method::guc::init();
+    // Register the custom bitmap-filtered vector search executor
+    access_method::custom_executor::register_custom_executor();
 }
 
 #[allow(non_snake_case)]

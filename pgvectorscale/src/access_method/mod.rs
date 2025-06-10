@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use pgrx::*;
 mod build;
 mod cost_estimate;
+pub mod custom_executor;
 mod debugging;
 pub mod distance;
 mod graph;
@@ -20,6 +21,8 @@ mod storage;
 mod storage_common;
 mod upgrade_test;
 mod vacuum;
+#[cfg(any(test, feature = "pg_test"))]
+mod bitmap_filtering_tests;
 
 /// Access method support function numbers
 pub const DISKANN_DISTANCE_TYPE_PROC: u16 = 1;
@@ -78,7 +81,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.ambeginscan = Some(scan::ambeginscan);
     amroutine.amrescan = Some(scan::amrescan);
     amroutine.amgettuple = Some(scan::amgettuple);
-    amroutine.amgetbitmap = None;
+    amroutine.amgetbitmap = Some(scan::amgetbitmap);
     amroutine.amendscan = Some(scan::amendscan);
 
     amroutine.ambuildphasename = Some(build::ambuildphasename);
