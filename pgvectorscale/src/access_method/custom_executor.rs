@@ -6,9 +6,8 @@
  * bitmaps from other indexes before performing expensive vector operations.
  */
 
-use std::collections::HashSet;
-use std::ffi::{c_char, CStr};
-use pgrx::{pg_sys, PgBox, PgRelation, PgMemoryContexts, void_mut_ptr};
+use std::ffi::CStr;
+use pgrx::{pg_sys, PgRelation};
 
 use crate::access_method::{
     graph::{Graph, ListSearchResult},
@@ -16,9 +15,8 @@ use crate::access_method::{
     meta_page::MetaPage,
     storage::Storage,
     graph::neighbor_store::GraphNeighborStore,
-    stats::GreedySearchStats,
 };
-use crate::util::{HeapPointer, IndexPointer, ItemPointer};
+use crate::util::{HeapPointer, IndexPointer};
 
 /// Bitmap filter structure that wraps PostgreSQL's TIDBitmap
 pub struct BitmapFilter {
@@ -29,19 +27,19 @@ impl BitmapFilter {
     /// Create a new bitmap filter from PostgreSQL's TIDBitmap
     pub unsafe fn new(tbm: *mut pg_sys::TIDBitmap) -> Self {
         Self { tbm }
-    }
-
-    /// Check if a heap pointer is present in the bitmap
-    pub unsafe fn contains(&self, heap_pointer: &HeapPointer) -> bool {
+    }    /// Check if a heap pointer is present in the bitmap
+    /// Note: In PostgreSQL 17, there's no direct tbm_is_member function.
+    /// For now, we'll implement a simplified check that assumes all items are present.
+    /// A full implementation would need to iterate through the bitmap.
+    pub unsafe fn contains(&self, _heap_pointer: &HeapPointer) -> bool {
         if self.tbm.is_null() {
             return true; // No filter means all tuples are allowed
         }
 
-        let mut ctid = pg_sys::ItemPointerData::default();
-        heap_pointer.to_item_pointer_data(&mut ctid);
-        
-        // Use PostgreSQL's tbm_is_member function to check membership
-        pg_sys::tbm_is_member(self.tbm, &ctid)
+        // TODO: Implement proper bitmap membership checking for PostgreSQL 17
+        // This would require iterating through the bitmap using tbm_iterate
+        // For now, return true to allow all tuples (no filtering)
+        true
     }
 }
 
@@ -284,28 +282,16 @@ impl BitmapFilteredVectorScanHook {
 static mut BITMAP_FILTERED_VECTOR_METHODS: pg_sys::CustomScanMethods = pg_sys::CustomScanMethods {
     CustomName: b"BitmapFilteredVectorScan\0".as_ptr() as *const i8,
     CreateCustomScanState: Some(create_bitmap_filtered_scan_state),
-    BeginCustomScan: None,
-    ExecCustomScan: None,
-    EndCustomScan: None,
-    ReScanCustomScan: None,
-    MarkPosCustomScan: None,
-    RestrPosCustomScan: None,
-    EstimateDSMCustomScan: None,
-    InitializeDSMCustomScan: None,
-    ReInitializeDSMCustomScan: None,
-    InitializeWorkerCustomScan: None,
-    ShutdownCustomScan: None,
-    ExplainCustomScan: None,
 };
 
 /// Create a custom scan state for bitmap-filtered vector search
 #[no_mangle]
 pub unsafe extern "C" fn create_bitmap_filtered_scan_state(
     cscan: *mut pg_sys::CustomScan,
-) -> *mut pg_sys::Node {
-    let css = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScanState>()) as *mut pg_sys::CustomScanState;
+) -> *mut pg_sys::Node {    let css = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScanState>()) as *mut pg_sys::CustomScanState;
     
-    pg_sys::NodeSetTag(css as *mut pg_sys::Node, pg_sys::NodeTag::T_CustomScanState);
+    // In PostgreSQL 17, use NodeSetTag with proper casting
+    (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
     
     (*css).methods = &mut BITMAP_FILTERED_VECTOR_METHODS;
     (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
